@@ -1,0 +1,19 @@
+rules:
+  v1.CreateTagRequest:
+    TagId: "required,uuid4"
+    OwnerId: "required,uuid4"
+    BoardId: "required,uuid4"
+    Name: "omitempty,max=100"
+    Color: "required,min=1,max=50"
+  v1.UpdateTagRequest:
+    TagId: "required,uuid4"
+    BoardId: "omitempty,uuid4"
+    Name: "omitempty,max=100"
+    Color: "omitempty,min=1,max=50"
+  v1.DeleteTagRequest:
+    TagId: "required,uuid4"
+  v1.TagsRequest:
+    PageSize: "required,min=1,max=1000"
+    TagIds: "omitempty,dive,uuid4"
+    OwnerIds: "omitempty,dive,uuid4"
+    BoardIds: "omitempty,dive,uuid4"
