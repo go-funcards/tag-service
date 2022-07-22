@@ -2,12 +2,13 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"github.com/go-funcards/mongodb"
 	"github.com/go-funcards/tag-service/internal/tag"
+	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.uber.org/zap"
 	"time"
 )
 
@@ -19,42 +20,45 @@ const (
 )
 
 type storage struct {
-	c mongodb.Collection[tag.Tag]
+	c   *mongo.Collection
+	log logrus.FieldLogger
 }
 
-func NewStorage(ctx context.Context, db *mongo.Database, logger *zap.Logger) (*storage, error) {
-	s := &storage{c: mongodb.Collection[tag.Tag]{
-		Inner: db.Collection(collection),
-		Log:   logger,
-	}}
-
-	if err := s.indexes(ctx); err != nil {
-		return nil, err
+func NewStorage(ctx context.Context, db *mongo.Database, log logrus.FieldLogger) *storage {
+	s := &storage{
+		c:   db.Collection(collection),
+		log: log,
 	}
-
-	return s, nil
+	s.indexes(ctx)
+	return s
 }
 
-func (s *storage) indexes(ctx context.Context) error {
-	name, err := s.c.Inner.Indexes().CreateOne(ctx, mongo.IndexModel{
+func (s *storage) indexes(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	name, err := s.c.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{
 			{"owner_id", 1},
 			{"board_id", 1},
 			{"created_at", 1},
 		},
 	})
-	if err == nil {
-		s.c.Log.Info("indexes created", zap.String("collection", collection), zap.String("name", name))
+	if err != nil {
+		s.log.WithFields(logrus.Fields{
+			"collection": collection,
+			"error":      err,
+		}).Fatal("index not created")
 	}
 
-	return err
+	s.log.WithFields(logrus.Fields{
+		"collection": collection,
+		"name":       name,
+	}).Info("index created")
 }
 
 func (s *storage) Save(ctx context.Context, model tag.Tag) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	data, err := s.c.ToM(model)
+	data, err := mongodb.ToBson(model)
 	if err != nil {
 		return err
 	}
@@ -63,7 +67,12 @@ func (s *storage) Save(ctx context.Context, model tag.Tag) error {
 	delete(data, "owner_id")
 	delete(data, "created_at")
 
-	return s.c.UpdateOne(
+	s.log.WithField("tag_id", model.TagID).Info("tag save")
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	result, err := s.c.UpdateOne(
 		ctx,
 		bson.M{"_id": model.TagID},
 		bson.M{
@@ -75,30 +84,68 @@ func (s *storage) Save(ctx context.Context, model tag.Tag) error {
 		},
 		options.Update().SetUpsert(true),
 	)
+	if err != nil {
+		return fmt.Errorf(fmt.Sprintf("tag save: %s", mongodb.ErrMsgQuery), err)
+	}
+
+	s.log.WithFields(logrus.Fields{
+		"tag_id": model.TagID,
+		"result": result,
+	}).Info("tag saved")
+
+	return nil
 }
 
 func (s *storage) Delete(ctx context.Context, id string) error {
-	return s.c.DeleteOne(ctx, bson.M{"_id": id})
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	s.log.WithField("tag_id", id).Debug("tag delete")
+	result, err := s.c.DeleteOne(ctx, bson.M{"_id": id})
+	if err != nil {
+		return fmt.Errorf(mongodb.ErrMsgQuery, err)
+	}
+	if result.DeletedCount == 0 {
+		return fmt.Errorf(mongodb.ErrMsgQuery, mongo.ErrNoDocuments)
+	}
+	s.log.WithField("tag_id", id).Debug("tag deleted")
+
+	return nil
 }
 
 func (s *storage) Find(ctx context.Context, filter tag.Filter, index uint64, size uint32) ([]tag.Tag, error) {
-	return s.c.Find(ctx, s.filter(filter), s.c.FindOptions(index, size).SetSort(bson.D{{"created_at", -1}}))
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	opts := mongodb.FindOptions(index, size).SetSort(bson.D{{"created_at", -1}})
+	cur, err := s.c.Find(ctx, s.build(filter), opts)
+	if err != nil {
+		return nil, fmt.Errorf(mongodb.ErrMsgQuery, err)
+	}
+	return mongodb.DecodeAll[tag.Tag](ctx, cur)
 }
 
 func (s *storage) Count(ctx context.Context, filter tag.Filter) (uint64, error) {
-	return s.c.CountDocuments(ctx, s.filter(filter))
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	total, err := s.c.CountDocuments(ctx, s.build(filter))
+	if err != nil {
+		return 0, fmt.Errorf(mongodb.ErrMsgQuery, err)
+	}
+	return uint64(total), nil
 }
 
-func (s *storage) filter(filter tag.Filter) bson.M {
-	f := make(bson.M)
+func (s *storage) build(filter tag.Filter) any {
+	f := make(mongodb.Filter, 0)
 	if len(filter.TagIDs) > 0 {
-		f["_id"] = bson.M{"$in": filter.TagIDs}
+		f = append(f, mongodb.In("_id", filter.TagIDs))
 	}
 	if len(filter.OwnerIDs) > 0 {
-		f["owner_id"] = bson.M{"$in": filter.OwnerIDs}
+		f = append(f, mongodb.In("owner_id", filter.OwnerIDs))
 	}
 	if len(filter.BoardIDs) > 0 {
-		f["board_id"] = bson.M{"$in": filter.BoardIDs}
+		f = append(f, mongodb.In("board_id", filter.BoardIDs))
 	}
-	return f
+	return f.Build()
 }

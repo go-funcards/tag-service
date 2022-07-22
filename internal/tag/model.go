@@ -21,7 +21,7 @@ type Filter struct {
 	BoardIDs []string `json:"board_ids,omitempty"`
 }
 
-func (t Tag) toResponse() *v1.TagsResponse_Tag {
+func (t Tag) toProto() *v1.TagsResponse_Tag {
 	return &v1.TagsResponse_Tag{
 		TagId:     t.TagID,
 		OwnerId:   t.OwnerID,
